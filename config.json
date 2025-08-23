@@ -1,0 +1,8 @@
+{
+  "GATE_MINT": "YOUR_REAL_MINT_HERE",
+  "MARKET_URL": "https://pump.fun/coin/YOUR_REAL_MINT_HERE",
+  "RPC_URL": "https://api.mainnet-beta.solana.com",
+  "USE_JITO": false,
+  "JITO_URL": "https://mainnet.block-engine.jito.wtf/api/v1/bundles",
+  "BIRDEYE_KEY": ""
+}

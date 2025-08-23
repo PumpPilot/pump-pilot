@@ -1,0 +1,762 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>PumpPilot Pro — Pump.fun Sniper (GH Pages)</title>
+  <meta name="description" content="Token‑gated, non‑custodial trading automation for Pump.fun & Raydium — with TP/SL, PnL, filters, and Jito bundles."/>
+
+  <!-- Tailwind CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = { theme: { extend: { colors: { bgd:'#060b12', pri:'#1f5aff', pri2:'#4d7fff', card:'#0c1522' }}}}
+  </script>
+
+  <!-- React UMD + Babel -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
+
+  <!-- Solana web3 IIFE -->
+  <script src="https://unpkg.com/@solana/web3.js@1.95.3/lib/index.iife.min.js"></script>
+
+  <style>
+    html,body,#root{height:100%}
+    .glass{background:rgba(6,11,18,.6);backdrop-filter:saturate(120%) blur(8px)}
+    .card{background:#0c1522}
+    code.k{padding:.1rem .35rem;border-radius:.4rem;background:rgba(255,255,255,.08)}
+    .mono{font-family: ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace}
+  </style>
+  <link rel="icon" type="image/png" href="./favicon.png"/>
+</head>
+<body class="min-h-screen text-white" style="background:#060b12">
+<div id="root"></div>
+
+<script type="text/babel">
+const {useState,useEffect,useRef} = React;
+
+/** =========================
+ *  CONFIG (defaults; override via /config.json or Settings UI)
+ *  ========================= */
+const DEFAULTS = {
+  RPC_URL: 'https://api.mainnet-beta.solana.com',
+  WS_URL: 'wss://pumpportal.fun/api/data',
+  TRADE_URL: 'https://pumpportal.fun/api/trade-local',
+  BIRDEYE_KEY: '',
+  GATE_MINT: 'YOUR_PUMPFUN_MINT',
+  MARKET_URL: 'https://pump.fun/coin/YOUR_PUMPFUN_MINT',
+  USE_JITO: false,
+  JITO_URL: 'https://mainnet.block-engine.jito.wtf/api/v1/bundles',
+};
+const CONFIG_URL = './config.json'; // optional file in repo
+
+// Cache keys
+const LS_KEYS = {
+  SETTINGS: 'ppro_settings_v1',
+  TRADES: (wallet)=>`ppro_trades_${wallet}`
+};
+
+// ---------- utils ----------
+const nowTs = ()=>new Date().toLocaleTimeString();
+const short = (k)=>k?k.slice(0,4)+'…'+k.slice(-4):'';
+const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
+function pushLog(setter,msg){ setter(p=>[...p.slice(-400), `[${nowTs()}] ${msg}`]); }
+function usd(n){ if(n===undefined || n===null || isNaN(n)) return '-'; return '$'+Number(n).toLocaleString(undefined,{maximumFractionDigits:4}); }
+
+/** Remote config loader (optional) */
+async function loadRemoteConfig(){
+  try{
+    const r = await fetch(CONFIG_URL, {cache:'no-store'});
+    if(!r.ok) return {};
+    const j = await r.json();
+    return j || {};
+  }catch(e){ return {}; }
+}
+function loadSettings(){ try{ return JSON.parse(localStorage.getItem(LS_KEYS.SETTINGS)) || {}; }catch(e){ return {}; } }
+function saveSettings(s){ localStorage.setItem(LS_KEYS.SETTINGS, JSON.stringify(s)); }
+function loadTrades(wallet){ try{ return JSON.parse(localStorage.getItem(LS_KEYS.TRADES(wallet)))||[] }catch(e){ return []; } }
+function saveTrades(wallet, arr){ localStorage.setItem(LS_KEYS.TRADES(wallet), JSON.stringify(arr)); }
+
+/** Fetch token metadata (best-effort) */
+async function fetchTokenInfo(mint){
+  try{
+    const r = await fetch(`https://pumpportal.fun/api/data/token-info?ca=${mint}`, {cache:'no-store'});
+    if(r.ok) return await r.json();
+  }catch(e){}
+  return { mint };
+}
+
+/** Birdeye helpers (optional; require API key) */
+async function birdeyePriceUSD(mint, apiKey){
+  if(!apiKey) return null;
+  try{
+    const r = await fetch(`https://public-api.birdeye.so/defi/price?address=${mint}`, { headers: { 'X-API-KEY': apiKey }});
+    if(!r.ok) return null;
+    const j = await r.json();
+    return j?.data?.value ?? null;
+  }catch(e){ return null; }
+}
+async function birdeyeOverview(mint, apiKey){
+  if(!apiKey) return null;
+  try{
+    const r = await fetch(`https://public-api.birdeye.so/defi/token_overview?address=${mint}`, { headers: { 'X-API-KEY': apiKey }});
+    if(!r.ok) return null;
+    const j = await r.json();
+    return j?.data ?? null;
+  }catch(e){ return null; }
+}
+
+/** Renounced heuristics from chain */
+async function checkMintRenounced(connection, mintPubkeyStr){
+  try{
+    const mintPk = new solanaWeb3.PublicKey(mintPubkeyStr);
+    const acc = await connection.getParsedAccountInfo(mintPk, 'processed');
+    const info = acc?.value?.data?.parsed?.info;
+    const mintAuth = info?.mintAuthority ?? info?.mint_authority ?? null;
+    const freezeAuth = info?.freezeAuthority ?? info?.freeze_authority ?? null;
+    return (!mintAuth && !freezeAuth);
+  }catch(e){ return false; }
+}
+
+/** FIFO PnL (best‑effort) */
+function calculatePnL(trades, pricesUSD){
+  const pos = {};
+  let realizedUSD = 0;
+  for(const t of trades){
+    if(!pos[t.mint]) pos[t.mint] = { qty:0, costUSD:0 };
+    if(t.side==='buy'){
+      pos[t.mint].qty += t.qty;
+      pos[t.mint].costUSD += t.qty * t.priceUSD;
+    }else if(t.side==='sell'){
+      let sellQty = t.qty;
+      while(sellQty>0 && pos[t.mint]?.qty>0){
+        const avg = pos[t.mint].costUSD / pos[t.mint].qty;
+        const take = Math.min(sellQty, pos[t.mint].qty);
+        realizedUSD += (t.priceUSD - avg) * take;
+        pos[t.mint].qty -= take;
+        pos[t.mint].costUSD -= avg * take;
+        sellQty -= take;
+      }
+    }
+  }
+  let unrealUSD = 0;
+  const open = [];
+  for(const [mint, p] of Object.entries(pos)){
+    if(p.qty>0){
+      const mkt = pricesUSD[mint] ?? null;
+      const avg = p.costUSD / p.qty;
+      const u = (mkt? (mkt - avg) * p.qty : 0);
+      unrealUSD += u;
+      open.push({ mint, qty:p.qty, avgUSD:avg, mktUSD:mkt, uPnL:u });
+    }
+  }
+  return { realizedUSD, unrealUSD, open };
+}
+
+/** Trade builder & sender */
+async function buildAndSend({walletPubkey, action, mint, amount, denomSol, slippage, priorityFee, pool, conn, sendMode, rpcUrl, jitoUrl, onLog}){
+  const body = { publicKey: walletPubkey, action, mint, amount, denominatedInSol: denomSol?"true":"false", slippage, priorityFee, pool };
+  const res = await fetch(DEFAULTS.TRADE_URL, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+  if(res.status!==200){ const t=await res.text(); throw new Error(`trade-local error: ${t.slice(0,200)}`); }
+  const buf = await res.arrayBuffer();
+  const tx = solanaWeb3.VersionedTransaction.deserialize(new Uint8Array(buf));
+
+  if(sendMode==='wallet'){
+    if(window?.phantom?.solana?.signAndSendTransaction){
+      const {signature} = await window.phantom.solana.signAndSendTransaction(tx);
+      onLog?.(`TX sent (wallet) sig ${short(signature)}`);
+      return { signature };
+    } else if(window?.solana?.signAndSendTransaction){
+      const {signature} = await window.solana.signAndSendTransaction(tx);
+      onLog?.(`TX sent (wallet) sig ${short(signature)}`);
+      return { signature };
+    }
+    sendMode='rpc';
+  }
+
+  let signed;
+  if(window?.solana?.signTransaction){
+    signed = await window.solana.signTransaction(tx);
+  } else {
+    throw new Error('Wallet cannot sign transactions (no signTransaction).');
+  }
+
+  if(sendMode==='rpc'){
+    const c = new solanaWeb3.Connection(rpcUrl||DEFAULTS.RPC_URL, 'confirmed');
+    const sig = await c.sendRawTransaction(signed.serialize(), { skipPreflight:false, maxRetries:3 });
+    onLog?.(`TX sent (rpc) sig ${short(sig)}`);
+    return { signature: sig };
+  }
+
+  if(sendMode==='jito'){
+    const b58tx = bs58Encode(signed.serialize());
+    const jitoResp = await fetch(jitoUrl||DEFAULTS.JITO_URL, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ jsonrpc:'2.0', id:1, method:'sendBundle', params:[[b58tx]] })
+    });
+    if(!jitoResp.ok){ const t = await jitoResp.text(); throw new Error(`Jito error: ${t.slice(0,200)}`); }
+    const sig = bs58Encode(signed.signatures[0]);
+    onLog?.(`TX sent (jito bundle) sig ${short(sig)}`);
+    return { signature: sig };
+  }
+
+  throw new Error('Unsupported send mode');
+}
+
+// base58 helper (lightweight)
+const BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+function bs58Encode(buffer){
+  let digits = [0];
+  for (let i = 0; i < buffer.length; i++) {
+    for (let j = 0; j < digits.length; j++) digits[j] <<= 8;
+    digits[0] += buffer[i];
+    let carry = 0;
+    for (let j = 0; j < digits.length; j++) {
+      digits[j] += carry;
+      carry = (digits[j] / 58) | 0;
+      digits[j] %= 58;
+    }
+    while (carry) { digits.push(carry % 58); carry = (carry / 58) | 0; }
+  }
+  for (let k = 0; k < buffer.length && buffer[k] === 0; k++) digits.push(0);
+  return digits.reverse().map(d=>BASE58_ALPHABET[d]).join('');
+}
+
+/** Bot hook with filters + TP/SL */
+function usePumpBot({wallet, conn, cfg, enabled, settings, onLog, onFill}){
+  const wsRef = useRef(null);
+  const runningRef = useRef(false);
+  const seenRef = useRef(new Set());
+  const lastBuyRef = useRef(0);
+
+  // TP/SL polling
+  useEffect(()=>{
+    if(!enabled || !wallet || !settings.BIRDEYE_KEY) return;
+    let stop=false;
+    async function loop(){
+      while(!stop){
+        try{
+          for(const mint of cfg.trackedMints || []){
+            const price = await birdeyePriceUSD(mint, settings.BIRDEYE_KEY);
+            if(price){
+              const t = cfg.positions[mint];
+              if(t && t.entryUSD && t.qty>0){
+                const chg = (price - t.entryUSD)/t.entryUSD;
+                if(cfg.tpPct>0 && chg >= cfg.tpPct){
+                  onLog(`TP hit ${short(mint)} → sell ${(cfg.sellPct*100).toFixed(0)}%`);
+                  await doSell(mint, Math.round(cfg.sellPct*100), price);
+                } else if(cfg.slPct>0 && -chg >= cfg.slPct){
+                  onLog(`SL hit ${short(mint)} → sell ${(cfg.sellPct*100).toFixed(0)}%`);
+                  await doSell(mint, Math.round(cfg.sellPct*100), price);
+                }
+              }
+            }
+          }
+        }catch(e){}
+        await sleep(4000);
+      }
+    }
+    loop();
+    return ()=>{ stop=true; };
+  }, [enabled, wallet, settings.BIRDEYE_KEY, cfg.tpPct, cfg.slPct, cfg.sellPct]);
+
+  useEffect(()=>{
+    runningRef.current = enabled;
+    if(!enabled){
+      if(wsRef.current){ try{ wsRef.current.close(); }catch{} wsRef.current=null; }
+      return;
+    }
+    const ws = new WebSocket(settings.WS_URL);
+    wsRef.current = ws;
+    ws.onopen = ()=>{
+      onLog('WS connected');
+      if(cfg.strategy!=='post_migration'){
+        ws.send(JSON.stringify({method:'subscribeNewToken'}));
+        onLog('subscribed new tokens');
+      }
+      ws.send(JSON.stringify({method:'subscribeMigration'}));
+      onLog('subscribed migrations');
+    };
+    ws.onclose = ()=> onLog('WS closed');
+    ws.onerror = ()=> onLog('WS error');
+    ws.onmessage = async (ev)=>{
+      if(!runningRef.current) return;
+      let msg; try{ msg = JSON.parse(ev.data); }catch{ return; }
+      const mint = msg?.mint || msg?.ca || msg?.tokenCA || msg?.token || msg?.address || null;
+      if(!mint) return;
+      const isMigration = (msg?.method==='subscribeMigration' || msg?.type==='migration' || msg?.event==='migration');
+      const isNewToken  = (msg?.method==='subscribeNewToken' || msg?.type==='create' || msg?.event==='newToken' || msg?.txType==='create');
+      if(isMigration){
+        if(cfg.strategy!=='new_tokens_only') maybeBuy(mint,'migration');
+      }else if(isNewToken && cfg.strategy!=='post_migration'){
+        maybeBuy(mint,'new');
+      }
+    };
+    return ()=>{ try{ ws.close(); }catch{} wsRef.current=null; };
+  }, [enabled, cfg.strategy, settings.WS_URL]);
+
+  async function passesFilters(mint){
+    if(cfg.requireRenounced){
+      const ok = await checkMintRenounced(conn, mint);
+      if(!ok) return { ok:false, why:'mint or freeze authority present' };
+    }
+    if(settings.BIRDEYE_KEY && cfg.minLiquidityUSD>0){
+      const ov = await birdeyeOverview(mint, settings.BIRDEYE_KEY);
+      const liq = ov?.liquidity ?? ov?.liquidityUSD ?? null;
+      if(!(liq && liq >= cfg.minLiquidityUSD)){
+        return { ok:false, why:`liquidity ${usd(liq||0)} < ${usd(cfg.minLiquidityUSD)}` };
+      }
+    }
+    if(cfg.badWords){
+      const meta = await fetchTokenInfo(mint);
+      const hay = (meta?.name+' '+meta?.symbol+' '+meta?.description).toLowerCase();
+      const bads = cfg.badWords.toLowerCase().split(',').map(s=>s.trim()).filter(Boolean);
+      if(hay && bads.some(b=>hay.includes(b))) return { ok:false, why:'matched bad words' };
+    }
+    return { ok:true };
+  }
+
+  async function maybeBuy(mint, trigger){
+    if(seenRef.current.has(mint)) return;
+    if(cfg.requireMigrationBeforeBuy && trigger!=='migration') return;
+    const now=Date.now(); if(now-lastBuyRef.current<cfg.cooldownMs) return; lastBuyRef.current=now;
+    if(!wallet){ onLog('Connect wallet first'); return; }
+
+    const pf = await passesFilters(mint);
+    if(!pf.ok){ onLog(`SKIP ${short(mint)} — ${pf.why}`); seenRef.current.add(mint); return; }
+
+    try{
+      onLog(`BUY → ${short(mint)} (${trigger})`);
+      const sendMode = settings.USE_JITO ? 'jito' : (settings.RPC_URL ? 'rpc' : 'wallet');
+      const { signature } = await buildAndSend({
+        walletPubkey: wallet, action:'buy', mint,
+        amount: cfg.maxSolPerTrade, denomSol:true,
+        slippage: cfg.slippagePct, priorityFee: cfg.priorityFee, pool: cfg.pool,
+        conn, sendMode, rpcUrl: settings.RPC_URL, jitoUrl: settings.JITO_URL, onLog
+      });
+      let priceUSD=null;
+      if(settings.BIRDEYE_KEY) priceUSD = await birdeyePriceUSD(mint, settings.BIRDEYE_KEY);
+      onFill?.({ mint, signature, priceUSD, buy:true });
+      if(!cfg.trackedMints.includes(mint)) cfg.trackedMints.push(mint);
+    }catch(e){ onLog(`ERR ${e?.message||e}`); }
+  }
+
+  async function doSell(mint, percent, currentPriceUSD){
+    try{
+      const sendMode = settings.USE_JITO ? 'jito' : (settings.RPC_URL ? 'rpc' : 'wallet');
+      const { signature } = await buildAndSend({
+        walletPubkey: wallet, action:'sell', mint,
+        amount: `${percent}%`, denomSol:false,
+        slippage: cfg.slippagePct, priorityFee: cfg.priorityFee, pool: cfg.pool,
+        conn, sendMode, rpcUrl: settings.RPC_URL, jitoUrl: settings.JITO_URL, onLog
+      });
+      onFill?.({ mint, signature, priceUSD: currentPriceUSD, sell:true, sellPct: percent });
+    }catch(e){ onLog(`SELL ERR ${e?.message||e}`); }
+  }
+
+  return { doSell };
+}
+
+/** ========================
+ *  MAIN APP
+ *  ======================== */
+function App(){
+  const [route,setRoute]=useState('home');
+  const [logs,setLogs]=useState([]);
+  const [wallet,setWallet]=useState(null);
+  const [conn,setConn]=useState(null);
+  const [holder,setHolder]=useState(false);
+  const [connecting,setConnecting]=useState(false);
+  const [preview,setPreview]=useState(false);
+  const [settings,setSettings]=useState(null); // loaded later
+
+  const [cfg,setCfg]=useState({
+    strategy:'hybrid', maxSolPerTrade:0.01, slippagePct:10, priorityFee:0.00005, pool:'auto',
+    cooldownMs: 1500,
+    tpPct: 0.20, slPct: 0.15, sellPct: 1.00,
+    badWords:'scam,rug,honeypot,rekt',
+    requireMigrationBeforeBuy:false,
+    requireRenounced:false,
+    minLiquidityUSD: 0,
+    trackedMints:[],
+    positions:{}
+  });
+  const [botOn,setBotOn]=useState(false);
+  const [pnl,setPnl]=useState({realizedUSD:0, unrealUSD:0, open:[]});
+
+  function log(s){ pushLog(setLogs,s); }
+
+  // initial: load /config.json then local settings
+  useEffect(()=>{
+    (async ()=>{
+      const rc = await (async()=>{try{const r=await fetch('./config.json',{cache:'no-store'}); if(!r.ok) return {}; return await r.json();}catch(e){return {};}})();
+      const merged = {...DEFAULTS, ...rc, ...loadSettings()};
+      setSettings(merged);
+      setConn(new solanaWeb3.Connection(merged.RPC_URL, 'processed'));
+    })();
+  }, []);
+
+  // recompute PnL when wallet or birdeye key changes
+  useEffect(()=>{
+    if(!wallet || !settings) return;
+    const trades = loadTrades(wallet);
+    (async ()=>{
+      const prices = {};
+      if(settings.BIRDEYE_KEY){
+        const uniq = [...new Set(trades.map(t=>t.mint))];
+        for(const m of uniq){ prices[m] = await birdeyePriceUSD(m, settings.BIRDEYE_KEY); }
+      }
+      setPnl(calculatePnL(trades, prices));
+    })();
+  }, [wallet, settings?.BIRDEYE_KEY]);
+
+  const bot = usePumpBot({
+    wallet: preview?'Preview11111111111111111111111111111111111111':wallet,
+    conn, cfg, enabled: botOn && (preview || holder),
+    settings: settings||DEFAULTS,
+    onLog: log,
+    onFill: async ({mint, signature, priceUSD, buy, sell, sellPct})=>{
+      if(!wallet || !settings) return;
+      let qty = 0;
+      try{
+        const acts = await conn.getParsedTokenAccountsByOwner(new solanaWeb3.PublicKey(wallet), { mint: new solanaWeb3.PublicKey(mint) }, 'processed');
+        qty = acts?.value?.[0]?.account?.data?.parsed?.info?.tokenAmount?.uiAmount ?? 0;
+      }catch(e){}
+      let side = buy?'buy':'sell';
+      if(sell){ qty = qty * (sellPct/100); }
+      let px = priceUSD || 0;
+      if(px===0 && settings.BIRDEYE_KEY) px = await birdeyePriceUSD(mint, settings.BIRDEYE_KEY) || 0;
+      const tr = { time:Date.now(), side, mint, qty:Math.max(qty,0), priceUSD:px, sig:signature||null };
+      const prev = loadTrades(wallet); prev.push(tr); saveTrades(wallet, prev);
+
+      const prices = {};
+      const uniq = [...new Set(prev.map(t=>t.mint))];
+      for(const m of uniq){ prices[m] = settings.BIRDEYE_KEY ? await birdeyePriceUSD(m, settings.BIRDEYE_KEY) : null; }
+      setPnl(calculatePnL(prev, prices));
+
+      setCfg(c=>{
+        const nc = {...c};
+        if(!nc.trackedMints.includes(mint)) nc.trackedMints.push(mint);
+        if(!nc.positions[mint]) nc.positions[mint] = { qty:0, entryUSD: px||0 };
+        nc.positions[mint].qty = qty;
+        if(px) nc.positions[mint].entryUSD = px;
+        return nc;
+      });
+    }
+  });
+
+  async function doConnect(){
+    try{
+      setConnecting(true);
+      if(!window?.solana){ alert('No Solana wallet detected. Install Phantom.'); return; }
+      const resp = await window.solana.connect();
+      const pk = resp.publicKey?.toString();
+      setWallet(pk); log(`Wallet ${short(pk)} connected`);
+      const ok = await holdsGateToken(conn, pk, settings||DEFAULTS);
+      setHolder(ok);
+      log(ok? '✅ Holder (gate unlocked)' : ((settings?.GATE_MINT||DEFAULTS.GATE_MINT)==='YOUR_PUMPFUN_MINT' ? '⚠️ Set GATE_MINT (Settings or config.json)' : '⛔ Not a holder — bot locked'));
+    } finally { setConnecting(false); }
+  }
+
+  function updateSetting(k,v){
+    setSettings(s=>{ const n={...(s||DEFAULTS),[k]:v}; saveSettings(n); if(k==='RPC_URL'){ setConn(new solanaWeb3.Connection(v||DEFAULTS.RPC_URL, 'processed')); } return n; });
+  }
+
+  if(!settings){
+    return (<div className="p-6 text-white/70">Loading…</div>);
+  }
+
+  return (
+    <div className="min-h-screen">
+      <Navbar onNav={setRoute} onLaunch={()=>setRoute('app')} />
+      {route==='home' && <Landing onLaunch={()=>setRoute('app')} settings={settings}/>}
+      {route==='app' && (
+        <main className="max-w-7xl mx-auto px-4 py-10">
+          <div className="flex items-center justify-between">
+            <h1 className="text-2xl font-semibold">Dashboard</h1>
+            <div className="flex items-center gap-2">
+              <div className="text-white/60 text-sm">Wallet: {wallet? short(wallet): 'not connected'}</div>
+              <button onClick={doConnect} disabled={connecting} className="inline-flex items-center justify-center rounded-xl px-3 py-2 font-medium border border-white/20 hover:bg-white/10">{connecting?'…':'Connect'}</button>
+              <button onClick={()=>{ setPreview(true); if(!botOn) log('Preview mode → Start Bot to simulate; real trades require Connect + holder'); }} className="inline-flex items-center justify-center rounded-xl px-3 py-2 font-medium border border-white/20 hover:bg-white/10">Preview</button>
+            </div>
+          </div>
+
+          <div className="grid lg:grid-cols-3 gap-6 mt-6">
+            <div className="lg:col-span-2 space-y-6">
+              {/* Bot Config */}
+              <div className="rounded-2xl p-6 border border-white/10 card">
+                <div className="text-lg font-semibold">Bot Config</div>
+                <div className="grid grid-cols-2 md:grid-cols-3 gap-3 mt-3 text-sm">
+                  <Label title="Strategy">
+                    <select className="bg-black/30 rounded p-2" value={cfg.strategy} onChange={e=>setCfg({...cfg, strategy:e.target.value})}>
+                      <option value="new_tokens_only">new_tokens_only</option>
+                      <option value="post_migration">post_migration</option>
+                      <option value="hybrid">hybrid</option>
+                    </select>
+                  </Label>
+                  <Label title="Max SOL / trade">
+                    <input className="bg-black/30 rounded p-2" type="number" step="0.001" value={cfg.maxSolPerTrade} onChange={e=>setCfg({...cfg, maxSolPerTrade:parseFloat(e.target.value)})}/>
+                  </Label>
+                  <Label title="Slippage %">
+                    <input className="bg-black/30 rounded p-2" type="number" step="0.1" value={cfg.slippagePct} onChange={e=>setCfg({...cfg, slippagePct:parseFloat(e.target.value)})}/>
+                  </Label>
+                  <Label title="Priority fee (SOL)">
+                    <input className="bg-black/30 rounded p-2" type="number" step="0.00001" value={cfg.priorityFee} onChange={e=>setCfg({...cfg, priorityFee:parseFloat(e.target.value)})}/>
+                  </Label>
+                  <Label title="Pool">
+                    <select className="bg-black/30 rounded p-2" value={cfg.pool} onChange={e=>setCfg({...cfg, pool:e.target.value})}>
+                      <option value="auto">auto</option><option value="pump">pump</option><option value="raydium">raydium</option>
+                      <option value="pump-amm">pump-amm</option><option value="raydium-cpmm">raydium-cpmm</option><option value="bonk">bonk</option><option value="launchlab">launchlab</option>
+                    </select>
+                  </Label>
+                  <Label title="Require migration before buy">
+                    <input type="checkbox" checked={cfg.requireMigrationBeforeBuy} onChange={e=>setCfg({...cfg, requireMigrationBeforeBuy:e.target.checked})}/>
+                  </Label>
+                  <Label title="Require renounced (mint & freeze null)">
+                    <input type="checkbox" checked={cfg.requireRenounced} onChange={e=>setCfg({...cfg, requireRenounced:e.target.checked})}/>
+                  </Label>
+                  <Label title="Min liquidity (USD)">
+                    <input className="bg-black/30 rounded p-2" type="number" step="1" value={cfg.minLiquidityUSD} onChange={e=>setCfg({...cfg, minLiquidityUSD:parseFloat(e.target.value)||0})}/>
+                  </Label>
+                  <Label title="Bad words (comma)" wide>
+                    <input className="bg-black/30 rounded p-2" value={cfg.badWords} onChange={e=>setCfg({...cfg, badWords:e.target.value})}/>
+                  </Label>
+                  <Label title="Cooldown ms">
+                    <input className="bg-black/30 rounded p-2" type="number" step="100" value={cfg.cooldownMs} onChange={e=>setCfg({...cfg, cooldownMs:parseInt(e.target.value)||1500})}/>
+                  </Label>
+                </div>
+                <div className="flex gap-3 mt-4">
+                  <button className="border border-white/20 hover:bg-white/10 rounded-xl px-4 py-2" onClick={()=>log('Saved')}>Save</button>
+                  <button className={"rounded-xl px-4 py-2 "+(botOn?'bg-white/10 border border-white/20':'bg-pri hover:bg-pri2')} onClick={()=>setBotOn(v=>!v)}>{botOn?'Stop Bot':'Start Bot'}</button>
+                </div>
+                <div className="mt-2 text-sm text-white/70">
+                  {preview ? 'Preview mode enabled. Use Connect + holder for real trades.' :
+                    ((settings.GATE_MINT||'YOUR_PUMPFUN_MINT')==='YOUR_PUMPFUN_MINT' ? 'Set Gate Mint in Settings or config.json' :
+                      (holder? 'Gate unlocked ✅' : 'Gate locked ⛔ — hold ≥1 of gate mint.'))}
+                </div>
+              </div>
+
+              {/* Logs */}
+              <div className="rounded-2xl p-6 border border-white/10 card">
+                <div className="text-lg font-semibold">Live Logs</div>
+                <div className="mt-3 h-80 overflow-auto bg-black/30 rounded p-3 mono text-xs space-y-1">
+                  {logs.map((l,i)=>(<div key={i}>{l}</div>))}
+                </div>
+              </div>
+            </div>
+
+            {/* Right column: TP/SL + PnL + Settings */}
+            <div className="space-y-6">
+              {/* TP/SL */}
+              <div className="rounded-2xl p-6 border border-white/10 card">
+                <div className="text-lg font-semibold">Auto-Sell (TP/SL)</div>
+                <div className="grid grid-cols-2 gap-3 mt-3 text-sm">
+                  <Label title="Take profit %">
+                    <input className="bg-black/30 rounded p-2" type="number" step="0.01" value={cfg.tpPct} onChange={e=>setCfg({...cfg, tpPct:parseFloat(e.target.value)||0})}/>
+                  </Label>
+                  <Label title="Stop loss %">
+                    <input className="bg-black/30 rounded p-2" type="number" step="0.01" value={cfg.slPct} onChange={e=>setCfg({...cfg, slPct:parseFloat(e.target.value)||0})}/>
+                  </Label>
+                  <Label title="Sell size %">
+                    <input className="bg-black/30 rounded p-2" type="number" step="0.05" value={cfg.sellPct} onChange={e=>setCfg({...cfg, sellPct:Math.max(0,Math.min(1,parseFloat(e.target.value)||0))})}/>
+                  </Label>
+                </div>
+                <div className="text-xs text-white/60 mt-2">Prices & liquidity require a Birdeye API key in Settings.</div>
+              </div>
+
+              {/* PnL */}
+              <div className="rounded-2xl p-6 border border-white/10 card">
+                <div className="text-lg font-semibold">Per-Wallet PnL</div>
+                <div className="mt-2 text-sm">Realized: <b>{usd(pnl.realizedUSD)}</b> &nbsp; | &nbsp; Unrealized: <b>{usd(pnl.unrealUSD)}</b></div>
+                <div className="mt-3">
+                  <table className="w-full text-sm">
+                    <thead className="text-white/70">
+                      <tr><th className="text-left py-1">Mint</th><th className="text-right">Qty</th><th className="text-right">Avg $</th><th className="text-right">Mkt $</th><th className="text-right">Unreal</th></tr>
+                    </thead>
+                    <tbody>
+                      {pnl.open.map((o,i)=>(
+                        <tr key={i} className="border-t border-white/10">
+                          <td className="py-1">{short(o.mint)}</td>
+                          <td className="text-right">{o.qty?.toLocaleString(undefined,{maximumFractionDigits:2})}</td>
+                          <td className="text-right">{usd(o.avgUSD)}</td>
+                          <td className="text-right">{usd(o.mktUSD)}</td>
+                          <td className="text-right">{usd(o.uPnL)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                <div className="text-xs text-white/60 mt-2">PnL is best‑effort and assumes fills ≈ balance changes.</div>
+              </div>
+
+              {/* Settings */}
+              <div className="rounded-2xl p-6 border border-white/10 card">
+                <div className="text-lg font-semibold">Settings</div>
+                <div className="grid grid-cols-2 gap-3 mt-3 text-sm">
+                  <Label title="RPC URL" wide>
+                    <input className="bg-black/30 rounded p-2" value={settings.RPC_URL} onChange={e=>updateSetting('RPC_URL', e.target.value)}/>
+                  </Label>
+                  <Label title="Gate Mint (holders unlock)" wide>
+                    <input className="bg-black/30 rounded p-2" value={settings.GATE_MINT} onChange={e=>updateSetting('GATE_MINT', e.target.value)}/>
+                  </Label>
+                  <Label title="Market URL" wide>
+                    <input className="bg-black/30 rounded p-2" value={settings.MARKET_URL} onChange={e=>updateSetting('MARKET_URL', e.target.value)}/>
+                  </Label>
+                  <Label title="Birdeye API Key" wide>
+                    <input className="bg-black/30 rounded p-2" placeholder="optional (for price/liquidity)" value={settings.BIRDEYE_KEY} onChange={e=>updateSetting('BIRDEYE_KEY', e.target.value)}/>
+                  </Label>
+                  <Label title="Use Jito bundle send">
+                    <input type="checkbox" checked={settings.USE_JITO} onChange={e=>updateSetting('USE_JITO', e.target.checked)}/>
+                  </Label>
+                  <Label title="Jito URL">
+                    <input className="bg-black/30 rounded p-2" value={settings.JITO_URL} onChange={e=>updateSetting('JITO_URL', e.target.value)}/>
+                  </Label>
+                </div>
+                <div className="text-xs text-white/60 mt-2">You can also create a <code class="k">config.json</code> in the repo to pre-set these for everyone.</div>
+              </div>
+            </div>
+          </div>
+        </main>
+      )}
+      {route==='docs' && <Docs settings={settings}/>}
+      {route==='terms' && <Legal title="Terms of Use"/>}
+      {route==='privacy' && <Legal title="Privacy Policy"/>}
+      <Footer/>
+    </div>
+  );
+}
+
+function Navbar({onNav,onLaunch}){
+  return (
+    <header className="sticky top-0 z-50 glass border-b border-white/10">
+      <div className="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between">
+        <button onClick={()=>onNav('home')} className="flex items-center gap-2">
+          <img src="./logo.png" alt="PumpPilot Logo" className="h-8 w-8 rounded"/>
+          <span className="font-semibold tracking-wide">PumpPilot Pro</span>
+        </button>
+        <nav className="flex items-center gap-6 text-sm">
+          <button className="hover:opacity-80" onClick={()=>onNav('docs')}>Docs</button>
+          <button className="hover:opacity-80" onClick={()=>onNav('terms')}>Terms</button>
+          <button className="hover:opacity-80" onClick={()=>onNav('privacy')}>Privacy</button>
+          <button onClick={onLaunch} className="inline-flex items-center justify-center rounded-xl px-4 py-2 font-medium bg-pri hover:bg-pri2 transition">Launch App</button>
+        </nav>
+      </div>
+    </header>
+  );
+}
+
+function Landing({onLaunch, settings}){
+  return (
+    <main>
+      <section className="max-w-7xl mx-auto px-4 pt-16 md:pt-24">
+        <div className="grid md:grid-cols-2 gap-10 items-center">
+          <div>
+            <h1 className="text-4xl md:text-6xl font-bold tracking-tight">Automate Pump.fun snipes with <span className="text-pri2">PumpPilot Pro</span></h1>
+            <p className="mt-4 text-lg text-white/70">Token‑gated, non‑custodial trading with TP/SL, PnL, filters, and optional Jito bundle send. Pure GitHub Pages.</p>
+            <div className="mt-6 flex gap-3">
+              <button onClick={onLaunch} className="inline-flex items-center justify-center rounded-xl px-4 py-2 font-medium bg-pri hover:bg-pri2 transition">Launch App</button>
+              <a href={settings.MARKET_URL} target="_blank" className="inline-flex items-center justify-center rounded-xl px-4 py-2 font-medium border border-white/20 hover:bg-white/10 transition">Buy Access Token</a>
+            </div>
+            <div className="mt-6 text-sm text-white/70">Gate Mint: <code className="k">{settings.GATE_MINT}</code></div>
+          </div>
+          <div className="rounded-2xl border border-white/10 p-6 card">
+            <div className="text-sm text-white/60 mb-2">Live Bot Console (sample)</div>
+            <div className="h-64 bg-black/50 rounded overflow-hidden p-3 mono text-xs text-white/80">
+              <ConsoleLines/>
+            </div>
+            <ul className="mt-4 grid grid-cols-2 gap-3">
+              <li className="rounded-xl p-4 border border-white/10 bg-white/5">No custody — wallet signs</li>
+              <li className="rounded-xl p-4 border border-white/10 bg-white/5">TP/SL auto‑sell, PnL</li>
+              <li className="rounded-xl p-4 border border-white/10 bg-white/5">Filters: renounced + liquidity</li>
+              <li className="rounded-xl p-4 border border-white/10 bg-white/5">Jito bundle send (optional)</li>
+            </ul>
+          </div>
+        </div>
+      </section>
+    </main>
+  );
+}
+
+function Feature({title, text}){
+  return (<div className="rounded-2xl p-5 border border-white/10 card"><div className="text-lg font-semibold">{title}</div><div className="text-white/70 mt-2">{text}</div></div>);
+}
+function InfoCard({label, value}){
+  return (<div className="rounded-xl p-4 border border-white/10 bg-white/5"><div className="text-white/60 text-xs uppercase">{label}</div><div className="mt-1 break-all">{value}</div></div>);
+}
+function Docs({settings}){
+  return (
+    <main className="max-w-7xl mx-auto px-4 py-10">
+      <h1 className="text-3xl font-bold">Docs</h1>
+      <h2 className="text-xl font-semibold mt-6">Access</h2>
+      <p>Hold ≥ <strong>1</strong> of the access token to unlock the app. Gate Mint: <code className="k">{settings.GATE_MINT}</code></p>
+      <h2 className="text-xl font-semibold mt-6">How it works</h2>
+      <ol className="list-decimal list-inside space-y-1 text-white/80">
+        <li>Connect wallet</li>
+        <li>Gate verifies you hold the token</li>
+        <li>Start the bot and adjust strategy; trades are built via trade‑local and signed in wallet.</li>
+      </ol>
+      <h2 className="text-xl font-semibold mt-6">Safety</h2>
+      <ul className="list-disc list-inside space-y-1 text-white/80">
+        <li>Start with tiny trade sizes</li>
+        <li>Use a dedicated hot wallet</li>
+        <li>Expect failures; on‑chain is probabilistic</li>
+      </ul>
+    </main>
+  );
+}
+function Legal({title}){
+  return (<main className="max-w-7xl mx-auto px-4 py-10"><h1 className="text-3xl font-bold">{title}</h1><p><em>Last updated: today</em></p><p className="text-white/80">Non‑custodial software. No financial advice. Crypto is risky; you can lose all funds.</p></main>);
+}
+function Footer(){
+  return (
+    <footer className="border-t border-white/10 mt-16">
+      <div className="max-w-7xl mx-auto px-4 py-10 text-sm text-white/70 flex flex-col md:flex-row gap-4 md:items-center justify-between">
+        <div>© {new Date().getFullYear()} PumpPilot. All rights reserved.</div>
+        <div className="flex gap-6">
+          <a className="hover:opacity-80" href="https://x.com" target="_blank">Twitter</a>
+          <a className="hover:opacity-80" href="mailto:team@example.com">Contact</a>
+        </div>
+      </div>
+    </footer>
+  );
+}
+function Label({title, children, wide}){
+  return (<label className={"flex flex-col "+(wide?"col-span-2":"")}><span className="text-white/80">{title}</span>{children}</label>);
+}
+function ConsoleLines({dense}){
+  const [lines, setLines] = React.useState([]);
+  React.useEffect(()=>{
+    const base = dense ? 600 : 1200;
+    const seed = ['WS connected','NEW  🟢 SAINT (ST) mint 8G...4fQ','heuristics OK → attempting buy…','BUY OK sig 4m...Zk2','MIGRATION ℹ️  8G...4fQ → Raydium'];
+    setLines(seed.map((s,i)=>`[12:00:${String(i).padStart(2,'0')}] ${s}`));
+    const id = setInterval(()=>{
+      const r=n=>String(Math.floor(Math.random()*n)).padStart(2,'0');
+      setLines(p=>[...p.slice(-20), `[12:${r(59)}:${r(59)}] NEW  🟢 ${randomWord()} (${randomWord(3)}) mint ${randMint()}`]);
+    }, base);
+    return ()=>clearInterval(id);
+  },[]);
+  return (<div className="space-y-1">{lines.map((l,i)=>(<div key={i}>{l}</div>))}</div>);
+}
+function randomWord(len=5){ const letters='ABCDEFGHIJKLMNOPQRSTUVWXYZ'; return Array.from({length:len},()=>letters[Math.floor(Math.random()*letters.length)]).join(''); }
+function randMint(){ const letters='123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'; return Array.from({length:2},()=>letters[Math.floor(Math.random()*letters.length)]).join('')+'...'+Array.from({length:2},()=>letters[Math.floor(Math.random()*letters.length)]).join(''); }
+
+/** Wallet gate uses current settings (remote + local) */
+async function holdsGateToken(connection, ownerPubkey, settings){
+  const GATE_MINT = (settings?.GATE_MINT || DEFAULTS.GATE_MINT);
+  if(!GATE_MINT || GATE_MINT==='YOUR_PUMPFUN_MINT') return false;
+  try {
+    const accounts = await connection.getParsedTokenAccountsByOwner(
+      new solanaWeb3.PublicKey(ownerPubkey),
+      { mint: new solanaWeb3.PublicKey(GATE_MINT) },
+      'processed'
+    );
+    const amt = accounts.value?.[0]?.account?.data?.parsed?.info?.tokenAmount?.uiAmount ?? 0;
+    return (amt && amt > 0);
+  } catch(e){ console.warn('gate check err', e); return false; }
+}
+
+// mount
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>
