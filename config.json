@@ -1,5 +1,5 @@
 {
-  "GATE_MINT": "YOUR_REAL_MINT_HERE",
+  "GATE_MINT": "2pSTPp6Yzx2QepzRZJBgwefaqVWgibpxDZchvu5Tpump",
   "MARKET_URL": "https://pump.fun/coin/YOUR_REAL_MINT_HERE",
   "RPC_URL": "https://api.mainnet-beta.solana.com",
   "USE_JITO": false,
